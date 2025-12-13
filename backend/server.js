@@ -1,58 +1,114 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios'); // To talk to Python
+const axios = require('axios');
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-// --- FAKE DATABASE (Simulated Parking Lots) ---
-// In a real project, this comes from MongoDB.
-const parkingSpots = [
-    { id: 1, name: "City Center Mall", lat: 23.25, lng: 77.41, type: "Mall" },
-    { id: 2, name: "Railway Station", lat: 23.26, lng: 77.42, type: "Public" },
-    { id: 3, name: "Tech Park Zone", lat: 23.27, lng: 77.40, type: "Office" }
-];
+// --- HELPER: Calculate Distance ---
+function calculateDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371; 
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+}
 
-// --- API: FIND PARKING ---
+// --- API ---
 app.post('/api/predict-parking', async (req, res) => {
-    const { day, hour, is_weekend } = req.body;
+    const { day, hour, is_weekend, userLat, userLng } = req.body;
+    console.log(`📍 Searching for Garages & Hotels near: ${userLat}, ${userLng}`);
 
-    console.log(`Request received: Day ${day}, Hour ${hour}`);
+    let finalSpots = [];
 
     try {
-        // 1. Ask Python AI for the "Occupancy Percentage"
-        // We send the data to the Python Server running on Port 5000
-        const pythonResponse = await axios.post('http://127.0.0.1:5000/predict', {
-            day_of_week: day,
-            hour: hour,
-            is_weekend: is_weekend
-        });
+        // 1. UPDATED QUERY: Ask for Parking, Garages (Car Repair), and Hotels
+        const query = `
+            [out:json];
+            (
+              node["amenity"="parking"](around:3000,${userLat},${userLng});
+              node["shop"="car_repair"](around:3000,${userLat},${userLng});
+              node["amenity"="fuel"](around:3000,${userLat},${userLng});
+              node["tourism"="hotel"](around:3000,${userLat},${userLng});
+              node["tourism"="guest_house"](around:3000,${userLat},${userLng});
+              node["shop"="mall"](around:3000,${userLat},${userLng});
+            );
+            out body;
+        `;
+        
+        const osmResponse = await axios.get(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`);
+        const realData = osmResponse.data.elements;
 
-        const predictedOccupancy = pythonResponse.data.occupancy_score;
+        // 2. PROCESS & RENAME SPOTS
+        if (realData && realData.length > 0) {
+            finalSpots = realData
+                .filter(item => item.tags && item.tags.name) // Must have a name
+                .map(spot => {
+                    let type = "Public";
+                    let displayName = spot.tags.name;
 
-        // 2. Update our Parking Spots with this prediction
-        const updatedSpots = parkingSpots.map(spot => {
-            // Add some randomness so every spot isn't exactly the same
-            let spotOccupancy = predictedOccupancy; 
-            if(spot.type === "Mall" && is_weekend) spotOccupancy += 10; 
+                    // Rename based on type for better UX
+                    if (spot.tags.shop === 'car_repair' || spot.tags.amenity === 'fuel') {
+                        type = "Garage/Service";
+                        displayName = `Garage: ${spot.tags.name}`;
+                    } else if (spot.tags.tourism === 'hotel' || spot.tags.tourism === 'guest_house') {
+                        type = "Hotel Parking";
+                        displayName = `Hotel: ${spot.tags.name}`;
+                    } else if (spot.tags.shop === 'mall') {
+                        type = "Mall Parking";
+                        displayName = `Mall: ${spot.tags.name}`;
+                    }
+
+                    return {
+                        id: spot.id,
+                        name: displayName,
+                        lat: spot.lat,
+                        lng: spot.lon,
+                        type: type
+                    };
+                });
+        }
+
+        // Fallback if nothing found
+        if (finalSpots.length === 0) {
+            console.log("⚠️ No named spots found.");
+            finalSpots = [{
+                id: 0, name: "General Public Parking Area", lat: userLat + 0.001, lng: userLng + 0.001, type: "General"
+            }];
+        }
+
+        // 3. AI PREDICTION
+        let predictedOccupancy = 50;
+        try {
+            const pythonResponse = await axios.post('http://127.0.0.1:5000/predict', { day_of_week: day, hour, is_weekend });
+            predictedOccupancy = pythonResponse.data.occupancy_score;
+        } catch (e) { }
+
+        // 4. FORMAT RESPONSE
+        const responseData = finalSpots.map(spot => {
+            const dist = calculateDistance(userLat, userLng, spot.lat, spot.lng);
             
+            // Hotels are usually busier on weekends
+            let adjustedOccupancy = predictedOccupancy;
+            if (spot.type === "Hotel Parking" && is_weekend) adjustedOccupancy += 20;
+
             return {
                 ...spot,
-                occupancy: spotOccupancy,
-                status: spotOccupancy > 85 ? "Full" : "Available"
+                distance: parseFloat(dist.toFixed(2)),
+                occupancy: Math.min(Math.round(adjustedOccupancy), 100), // Cap at 100%
+                status: adjustedOccupancy > 85 ? "Full" : "Available"
             };
-        });
+        }).sort((a, b) => a.distance - b.distance).slice(0, 10); // Return top 10 results now
 
-        res.json(updatedSpots);
+        res.json(responseData);
 
     } catch (error) {
-        console.error("Error connecting to Python AI:", error.message);
-        res.status(500).json({ error: "AI Service is down" });
+        console.error(error);
+        res.status(500).send("Error");
     }
 });
 
-// Start Server on Port 3000
-app.listen(3000, () => {
-    console.log('Node Backend running on http://localhost:3000');
-});
+app.listen(4000, () => console.log('✅ Server running on port 4000'));
